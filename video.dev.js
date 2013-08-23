@@ -457,8 +457,9 @@ vjs.trigger = function(elem, event) {
     elemData.dispatcher.call(elem, event);
   }
 
-  // Unless explicitly stopped, recursively calls this function to bubble the event up the DOM.
-  if (parent && !event.isPropagationStopped()) {
+  // Unless explicitly stopped or the event does not bubble (e.g. media events)
+  // recursively calls this function to bubble the event up the DOM.
+  if (parent && !event.isPropagationStopped() && event.bubbles !== false) {
     vjs.trigger(parent, event);
 
   // If at the top of the DOM, triggers the default action unless disabled.
@@ -509,10 +510,12 @@ vjs.trigger = function(elem, event) {
  * @return {[type]}
  */
 vjs.one = function(elem, type, fn) {
-  vjs.on(elem, type, function(){
-    vjs.off(elem, type, arguments.callee);
+  var func = function(){
+    vjs.off(elem, type, func);
     fn.apply(this, arguments);
-  });
+  };
+  func.guid = fn.guid = fn.guid || vjs.guid++;
+  vjs.on(elem, type, func);
 };
 var hasOwnProp = Object.prototype.hasOwnProperty;
 
@@ -859,6 +862,7 @@ vjs.IS_OLD_ANDROID = vjs.IS_ANDROID && (/webkit/i).test(vjs.USER_AGENT) && vjs.A
 vjs.IS_FIREFOX = (/Firefox/i).test(vjs.USER_AGENT);
 vjs.IS_CHROME = (/Chrome/i).test(vjs.USER_AGENT);
 
+vjs.TOUCH_ENABLED = ('ontouchstart' in window);
 
 /**
  * Get an element's attribute values, as defined on the HTML tag
@@ -1203,6 +1207,8 @@ vjs.Component = vjs.CoreObject.extend({
  * Dispose of the component and all child components.
  */
 vjs.Component.prototype.dispose = function(){
+  this.trigger('dispose');
+
   // Dispose all children.
   if (this.children_) {
     for (var i = this.children_.length - 1; i >= 0; i--) {
@@ -1696,26 +1702,6 @@ vjs.Component.prototype.hide = function(){
 };
 
 /**
- * Fade a component in using CSS
- * @return {vjs.Component}
- */
-vjs.Component.prototype.fadeIn = function(){
-  this.removeClass('vjs-fade-out');
-  this.addClass('vjs-fade-in');
-  return this;
-};
-
-/**
- * Fade a component out using CSS
- * @return {vjs.Component}
- */
-vjs.Component.prototype.fadeOut = function(){
-  this.removeClass('vjs-fade-in');
-  this.addClass('vjs-fade-out');
-  return this;
-};
-
-/**
  * Lock an item in its visible state. To be used with fadeIn/fadeOut.
  * @return {vjs.Component}
  */
@@ -1739,14 +1725,7 @@ vjs.Component.prototype.unlockShowing = function(){
 vjs.Component.prototype.disable = function(){
   this.hide();
   this.show = function(){};
-  this.fadeIn = function(){};
 };
-
-// TODO: Get enable working
-// vjs.Component.prototype.enable = function(){
-//   this.fadeIn = vjs.Component.prototype.fadeIn;
-//   this.show = vjs.Component.prototype.show;
-// };
 
 /**
  * If a value is provided it will change the width of the player to that value
@@ -1849,6 +1828,53 @@ vjs.Component.prototype.dimension = function(widthOrHeight, num, skipListeners){
     // }
   }
 };
+
+/**
+ * Emit 'tap' events when touch events are supported. We're requireing them to
+ * be enabled because otherwise every component would have this extra overhead
+ * unnecessarily, on mobile devices where extra overhead is especially bad.
+ *
+ * This is being implemented so we can support taps on the video element
+ * toggling the controls.
+ */
+vjs.Component.prototype.emitTapEvents = function(){
+  var touchStart, touchTime, couldBeTap, noTap;
+
+  // Track the start time so we can determine how long the touch lasted
+  touchStart = 0;
+
+  this.on('touchstart', function(event) {
+    // Record start time so we can detect a tap vs. "touch and hold"
+    touchStart = new Date().getTime();
+    // Reset couldBeTap tracking
+    couldBeTap = true;
+  });
+
+  noTap = function(){
+    couldBeTap = false;
+  };
+  // TODO: Listen to the original target. http://youtu.be/DujfpXOKUp8?t=13m8s
+  this.on('touchmove', noTap);
+  this.on('touchleave', noTap);
+  this.on('touchcancel', noTap);
+
+  // When the touch ends, measure how long it took and trigger the appropriate
+  // event
+  this.on('touchend', function() {
+    // Proceed only if the touchmove/leave/cancel event didn't happen
+    if (couldBeTap === true) {
+      // Measure how long the touch lasted
+      touchTime = new Date().getTime() - touchStart;
+      // The touch needs to be quick in order to consider it a tap
+      if (touchTime < 250) {
+        this.trigger('tap');
+        // It may be good to copy the touchend event object and change the
+        // type to tap, if the other event properties aren't exact after
+        // vjs.fixEvent runs (e.g. event.target)
+      }
+    }
+  });
+};
 /* Button - Base class for all buttons
 ================================================================================ */
 /**
@@ -1863,7 +1889,9 @@ vjs.Button = vjs.Component.extend({
     vjs.Component.call(this, player, options);
 
     var touchstart = false;
-    this.on('touchstart', function() {
+    this.on('touchstart', function(event) {
+      // Stop click and other mouse events from triggering also
+      event.preventDefault();
       touchstart = true;
     });
     this.on('touchmove', function() {
@@ -1875,7 +1903,6 @@ vjs.Button = vjs.Component.extend({
         self.onClick(event);
       }
       event.preventDefault();
-      event.stopPropagation();
     });
 
     this.on('click', this.onClick);
@@ -2282,7 +2309,7 @@ vjs.MenuButton.prototype.createMenu = function(){
     }));
   }
 
-  this.items = this.createItems();
+  this.items = this['createItems']();
 
   if (this.items) {
     // Add menu items to the menu
@@ -2386,21 +2413,29 @@ vjs.Player = vjs.Component.extend({
     this.poster_ = options['poster'];
     // Set controls
     this.controls_ = options['controls'];
-    // Use native controls for iOS and Android by default
-    //  until controls are more stable on those devices.
-    if (options['customControlsOnMobile'] !== true && (vjs.IS_IOS || vjs.IS_ANDROID)) {
-      tag.controls = options['controls'];
-      this.controls_ = false;
-    } else {
-      // Original tag settings stored in options
-      // now remove immediately so native controls don't flash.
-      tag.controls = false;
-    }
+    // Original tag settings stored in options
+    // now remove immediately so native controls don't flash.
+    // May be turned back on by HTML5 tech if nativeControlsForTouch is true
+    tag.controls = false;
 
     // Run base component initializing with new options.
     // Builds the element through createEl()
     // Inits and embeds any child components in opts
     vjs.Component.call(this, this, options, ready);
+
+    // Update controls className. Can't do this when the controls are initially
+    // set because the element doesn't exist yet.
+    if (this.controls()) {
+      this.addClass('vjs-controls-enabled');
+    } else {
+      this.addClass('vjs-controls-disabled');
+    }
+
+    // TODO: Make this smarter. Toggle user state between touching/mousing
+    // using events, since devices can have both touch and mouse events.
+    // if (vjs.TOUCH_ENABLED) {
+    //   this.addClass('vjs-touch-enabled');
+    // }
 
     // Firstplay event implimentation. Not sold on the event yet.
     // Could probably just check currentTime==0?
@@ -2433,6 +2468,8 @@ vjs.Player = vjs.Component.extend({
         this[key](val);
       }, this);
     }
+
+    this.listenForUserActivity();
   }
 });
 
@@ -2448,7 +2485,9 @@ vjs.Player = vjs.Component.extend({
 vjs.Player.prototype.options_ = vjs.options;
 
 vjs.Player.prototype.dispose = function(){
-  // this.isReady_ = false;
+  this.trigger('dispose');
+  // prevent dispose from being called twice
+  this.off('dispose');
 
   // Kill reference to this player
   vjs.players[this.id_] = null;
@@ -2737,6 +2776,8 @@ vjs.Player.prototype.onFirstPlay = function(){
     if(this.options_['starttime']){
       this.currentTime(this.options_['starttime']);
     }
+
+    this.addClass('vjs-has-started');
 };
 
 vjs.Player.prototype.onPause = function(){
@@ -2906,11 +2947,12 @@ vjs.Player.prototype.remainingTime = function(){
 vjs.Player.prototype.buffered = function(){
   var buffered = this.techGet('buffered'),
       start = 0,
+      buflast = buffered.length - 1,
       // Default end to 0 and store in values
       end = this.cache_.bufferEnd = this.cache_.bufferEnd || 0;
 
-  if (buffered && buffered.length > 0 && buffered.end(0) !== end) {
-    end = buffered.end(0);
+  if (buffered && buflast >= 0 && buffered.end(buflast) !== end) {
+    end = buffered.end(buflast);
     // Storing values allows them be overridden by setBufferedFromProgress
     this.cache_.bufferEnd = end;
   }
@@ -3207,19 +3249,187 @@ vjs.Player.prototype.controls_;
  * @param  {Boolean} controls Set controls to showing or not
  * @return {Boolean}    Controls are showing
  */
-vjs.Player.prototype.controls = function(controls){
-  if (controls !== undefined) {
+vjs.Player.prototype.controls = function(bool){
+  if (bool !== undefined) {
+    bool = !!bool; // force boolean
     // Don't trigger a change event unless it actually changed
-    if (this.controls_ !== controls) {
-      this.controls_ = !!controls; // force boolean
-      this.trigger('controlschange');
+    if (this.controls_ !== bool) {
+      this.controls_ = bool;
+      if (bool) {
+        this.removeClass('vjs-controls-disabled');
+        this.addClass('vjs-controls-enabled');
+        this.trigger('controlsenabled');
+      } else {
+        this.removeClass('vjs-controls-enabled');
+        this.addClass('vjs-controls-disabled');
+        this.trigger('controlsdisabled');
+      }
     }
+    return this;
   }
   return this.controls_;
 };
 
+vjs.Player.prototype.usingNativeControls_;
+
+/**
+ * Toggle native controls on/off. Native controls are the controls built into
+ * devices (e.g. default iPhone controls), Flash, or other techs
+ * (e.g. Vimeo Controls)
+ *
+ * **This should only be set by the current tech, because only the tech knows
+ * if it can support native controls**
+ *
+ * @param  {Boolean} bool    True signals that native controls are on
+ * @return {vjs.Player}      Returns the player
+ */
+vjs.Player.prototype.usingNativeControls = function(bool){
+  if (bool !== undefined) {
+    bool = !!bool; // force boolean
+    // Don't trigger a change event unless it actually changed
+    if (this.usingNativeControls_ !== bool) {
+      this.usingNativeControls_ = bool;
+      if (bool) {
+        this.addClass('vjs-using-native-controls');
+        this.trigger('usingnativecontrols');
+      } else {
+        this.removeClass('vjs-using-native-controls');
+        this.trigger('usingcustomcontrols');
+      }
+    }
+    return this;
+  }
+  return this.usingNativeControls_;
+};
+
 vjs.Player.prototype.error = function(){ return this.techGet('error'); };
 vjs.Player.prototype.ended = function(){ return this.techGet('ended'); };
+
+// When the player is first initialized, trigger activity so components
+// like the control bar show themselves if needed
+vjs.Player.prototype.userActivity_ = true;
+vjs.Player.prototype.reportUserActivity = function(event){
+  this.userActivity_ = true;
+};
+
+vjs.Player.prototype.userActive_ = true;
+vjs.Player.prototype.userActive = function(bool){
+  if (bool !== undefined) {
+    bool = !!bool;
+    if (bool !== this.userActive_) {
+      this.userActive_ = bool;
+      if (bool) {
+        // If the user was inactive and is now active we want to reset the
+        // inactivity timer
+        this.userActivity_ = true;
+        this.removeClass('vjs-user-inactive');
+        this.addClass('vjs-user-active');
+        this.trigger('useractive');
+      } else {
+        // We're switching the state to inactive manually, so erase any other
+        // activity
+        this.userActivity_ = false;
+
+        // Chrome/Safari/IE have bugs where when you change the cursor it can
+        // trigger a mousemove event. This causes an issue when you're hiding
+        // the cursor when the user is inactive, and a mousemove signals user
+        // activity. Making it impossible to go into inactive mode. Specifically
+        // this happens in fullscreen when we really need to hide the cursor.
+        //
+        // When this gets resolved in ALL browsers it can be removed
+        // https://code.google.com/p/chromium/issues/detail?id=103041
+        this.tech.one('mousemove', function(e){
+          e.stopPropagation();
+          e.preventDefault();
+        });
+        this.removeClass('vjs-user-active');
+        this.addClass('vjs-user-inactive');
+        this.trigger('userinactive');
+      }
+    }
+    return this;
+  }
+  return this.userActive_;
+};
+
+vjs.Player.prototype.listenForUserActivity = function(){
+  var onMouseActivity, onMouseDown, mouseInProgress, onMouseUp,
+      activityCheck, inactivityTimeout;
+
+  onMouseActivity = this.reportUserActivity;
+
+  onMouseDown = function() {
+    onMouseActivity();
+    // For as long as the they are touching the device or have their mouse down,
+    // we consider them active even if they're not moving their finger or mouse.
+    // So we want to continue to update that they are active
+    clearInterval(mouseInProgress);
+    // Setting userActivity=true now and setting the interval to the same time
+    // as the activityCheck interval (250) should ensure we never miss the
+    // next activityCheck
+    mouseInProgress = setInterval(vjs.bind(this, onMouseActivity), 250);
+  };
+
+  onMouseUp = function(event) {
+    onMouseActivity();
+    // Stop the interval that maintains activity if the mouse/touch is down
+    clearInterval(mouseInProgress);
+  };
+
+  // Any mouse movement will be considered user activity
+  this.on('mousedown', onMouseDown);
+  this.on('mousemove', onMouseActivity);
+  this.on('mouseup', onMouseUp);
+
+  // Listen for keyboard navigation
+  // Shouldn't need to use inProgress interval because of key repeat
+  this.on('keydown', onMouseActivity);
+  this.on('keyup', onMouseActivity);
+
+  // Consider any touch events that bubble up to be activity
+  // Certain touches on the tech will be blocked from bubbling because they
+  // toggle controls
+  this.on('touchstart', onMouseDown);
+  this.on('touchmove', onMouseActivity);
+  this.on('touchend', onMouseUp);
+  this.on('touchcancel', onMouseUp);
+
+  // Run an interval every 250 milliseconds instead of stuffing everything into
+  // the mousemove/touchmove function itself, to prevent performance degradation.
+  // `this.reportUserActivity` simply sets this.userActivity_ to true, which
+  // then gets picked up by this loop
+  // http://ejohn.org/blog/learning-from-twitter/
+  activityCheck = setInterval(vjs.bind(this, function() {
+    // Check to see if mouse/touch activity has happened
+    if (this.userActivity_) {
+      // Reset the activity tracker
+      this.userActivity_ = false;
+
+      // If the user state was inactive, set the state to active
+      this.userActive(true);
+
+      // Clear any existing inactivity timeout to start the timer over
+      clearTimeout(inactivityTimeout);
+
+      // In X seconds, if no more activity has occurred the user will be
+      // considered inactive
+      inactivityTimeout = setTimeout(vjs.bind(this, function() {
+        // Protect against the case where the inactivityTimeout can trigger just
+        // before the next user activity is picked up by the activityCheck loop
+        // causing a flicker
+        if (!this.userActivity_) {
+          this.userActive(false);
+        }
+      }), 2000);
+    }
+  }), 250);
+
+  // Clean up the intervals when we kill the player
+  this.on('dispose', function(){
+    clearInterval(activityCheck);
+    clearTimeout(inactivityTimeout);
+  });
+};
 
 // Methods to add support for
 // networkState: function(){ return this.techCall('networkState'); },
@@ -3288,61 +3498,15 @@ vjs.Player.prototype.ended = function(){ return this.techGet('ended'); };
   }
 
 })();
+
+
 /**
  * Container of main controls
  * @param {vjs.Player|Object} player
  * @param {Object=} options
  * @constructor
  */
-vjs.ControlBar = vjs.Component.extend({
-  /** @constructor */
-  init: function(player, options){
-    vjs.Component.call(this, player, options);
-
-    if (!player.controls()) {
-      this.disable();
-    }
-
-    player.one('play', vjs.bind(this, function(){
-      var touchstart,
-        fadeIn = vjs.bind(this, this.fadeIn),
-        fadeOut = vjs.bind(this, this.fadeOut);
-
-      this.fadeIn();
-
-      if ( !('ontouchstart' in window) ) {
-        this.player_.on('mouseover', fadeIn);
-        this.player_.on('mouseout', fadeOut);
-        this.player_.on('pause', vjs.bind(this, this.lockShowing));
-        this.player_.on('play', vjs.bind(this, this.unlockShowing));
-      }
-
-      touchstart = false;
-      this.player_.on('touchstart', function() {
-        touchstart = true;
-      });
-      this.player_.on('touchmove', function() {
-        touchstart = false;
-      });
-      this.player_.on('touchend', vjs.bind(this, function(event) {
-        var idx;
-        if (touchstart) {
-          idx = this.el().className.search('fade-in');
-          if (idx !== -1) {
-            this.fadeOut();
-          } else {
-            this.fadeIn();
-          }
-        }
-        touchstart = false;
-
-        if (!this.player_.paused()) {
-          event.preventDefault();
-        }
-      }));
-    }));
-  }
-});
+vjs.ControlBar = vjs.Component.extend();
 
 vjs.ControlBar.prototype.options_ = {
   loadEvent: 'play',
@@ -3365,16 +3529,7 @@ vjs.ControlBar.prototype.createEl = function(){
     className: 'vjs-control-bar'
   });
 };
-
-vjs.ControlBar.prototype.fadeIn = function(){
-  vjs.Component.prototype.fadeIn.call(this);
-  this.player_.trigger('controlsvisible');
-};
-
-vjs.ControlBar.prototype.fadeOut = function(){
-  vjs.Component.prototype.fadeOut.call(this);
-  this.player_.trigger('controlshidden');
-};/**
+/**
  * Button to toggle between play and pause
  * @param {vjs.Player|Object} player
  * @param {Object=} options
@@ -4037,7 +4192,10 @@ vjs.PosterImage.prototype.createEl = function(){
 };
 
 vjs.PosterImage.prototype.onClick = function(){
-  this.player_.play();
+  // Only accept clicks when controls are enabled
+  if (this.player().controls()) {
+    this.player_.play();
+  }
 };
 /* Loading Spinner
 ================================================================================ */
@@ -4082,24 +4240,13 @@ vjs.LoadingSpinner.prototype.createEl = function(){
 /* Big Play Button
 ================================================================================ */
 /**
- * Initial play button. Shows before the video has played.
+ * Initial play button. Shows before the video has played. The hiding of the
+ * big play button is done via CSS and player states.
  * @param {vjs.Player|Object} player
  * @param {Object=} options
  * @constructor
  */
-vjs.BigPlayButton = vjs.Button.extend({
-  /** @constructor */
-  init: function(player, options){
-    vjs.Button.call(this, player, options);
-
-    if (!player.controls()) {
-      this.hide();
-    }
-
-    player.on('play', vjs.bind(this, this.hide));
-    // player.on('ended', vjs.bind(this, this.show));
-  }
-});
+vjs.BigPlayButton = vjs.Button.extend();
 
 vjs.BigPlayButton.prototype.createEl = function(){
   return vjs.Button.prototype.createEl.call(this, 'div', {
@@ -4110,15 +4257,11 @@ vjs.BigPlayButton.prototype.createEl = function(){
 };
 
 vjs.BigPlayButton.prototype.onClick = function(){
-  // Go back to the beginning if big play button is showing at the end.
-  // Have to check for current time otherwise it might throw a 'not ready' error.
-  //if(this.player_.currentTime()) {
-    //this.player_.currentTime(0);
-  //}
   this.player_.play();
 };
 /**
- * @fileoverview Media Technology Controller - Base class for media playback technology controllers like Flash and HTML5
+ * @fileoverview Media Technology Controller - Base class for media playback
+ * technology controllers like Flash and HTML5
  */
 
 /**
@@ -4132,37 +4275,144 @@ vjs.MediaTechController = vjs.Component.extend({
   init: function(player, options, ready){
     vjs.Component.call(this, player, options, ready);
 
-    // Make playback element clickable
-    // this.addEvent('click', this.proxy(this.onClick));
-
-    // player.triggerEvent('techready');
+    this.initControlsListeners();
   }
 });
 
-// destroy: function(){},
-// createElement: function(){},
+/**
+ * Set up click and touch listeners for the playback element
+ * On desktops, a click on the video itself will toggle playback,
+ * on a mobile device a click on the video toggles controls.
+ * (toggling controls is done by toggling the user state between active and
+ * inactive)
+ *
+ * A tap can signal that a user has become active, or has become inactive
+ * e.g. a quick tap on an iPhone movie should reveal the controls. Another
+ * quick tap should hide them again (signaling the user is in an inactive
+ * viewing state)
+ *
+ * In addition to this, we still want the user to be considered inactive after
+ * a few seconds of inactivity.
+ *
+ * Note: the only part of iOS interaction we can't mimic with this setup
+ * is a touch and hold on the video element counting as activity in order to
+ * keep the controls showing, but that shouldn't be an issue. A touch and hold on
+ * any controls will still keep the user active
+ */
+vjs.MediaTechController.prototype.initControlsListeners = function(){
+  var player, tech, activateControls, deactivateControls;
+
+  tech = this;
+  player = this.player();
+
+  var activateControls = function(){
+    if (player.controls() && !player.usingNativeControls()) {
+      tech.addControlsListeners();
+    }
+  };
+
+  deactivateControls = vjs.bind(tech, tech.removeControlsListeners);
+
+  // Set up event listeners once the tech is ready and has an element to apply
+  // listeners to
+  this.ready(activateControls);
+  player.on('controlsenabled', activateControls);
+  player.on('controlsdisabled', deactivateControls);
+};
+
+vjs.MediaTechController.prototype.addControlsListeners = function(){
+  var preventBubble, userWasActive;
+
+  // Some browsers (Chrome & IE) don't trigger a click on a flash swf, but do
+  // trigger mousedown/up.
+  // http://stackoverflow.com/questions/1444562/javascript-onclick-event-over-flash-object
+  // Any touch events are set to block the mousedown event from happening
+  this.on('mousedown', this.onClick);
+
+  // We need to block touch events on the video element from bubbling up,
+  // otherwise they'll signal activity prematurely. The specific use case is
+  // when the video is playing and the controls have faded out. In this case
+  // only a tap (fast touch) should toggle the user active state and turn the
+  // controls back on. A touch and move or touch and hold should not trigger
+  // the controls (per iOS as an example at least)
+  //
+  // We always want to stop propagation on touchstart because touchstart
+  // at the player level starts the touchInProgress interval. We can still
+  // report activity on the other events, but won't let them bubble for
+  // consistency. We don't want to bubble a touchend without a touchstart.
+  this.on('touchstart', function(event) {
+    // Stop the mouse events from also happening
+    event.preventDefault();
+    event.stopPropagation();
+    // Record if the user was active now so we don't have to keep polling it
+    userWasActive = this.player_.userActive();
+  });
+
+  preventBubble = function(event){
+    event.stopPropagation();
+    if (userWasActive) {
+      this.player_.reportUserActivity();
+    }
+  };
+
+  // Treat all touch events the same for consistency
+  this.on('touchmove', preventBubble);
+  this.on('touchleave', preventBubble);
+  this.on('touchcancel', preventBubble);
+  this.on('touchend', preventBubble);
+
+  // Turn on component tap events
+  this.emitTapEvents();
+
+  // The tap listener needs to come after the touchend listener because the tap
+  // listener cancels out any reportedUserActivity when setting userActive(false)
+  this.on('tap', this.onTap);
+};
 
 /**
- * Handle a click on the media element. By default will play the media.
- *
- * On android browsers, having this toggle play state interferes with being
- * able to toggle the controls and toggling play state with the play button
+ * Remove the listeners used for click and tap controls. This is needed for
+ * toggling to controls disabled, where a tap/touch should do nothing.
  */
-vjs.MediaTechController.prototype.onClick = (function(){
-  if (vjs.IS_ANDROID) {
-    return function () {};
-  } else {
-    return function () {
-      if (this.player_.controls()) {
-        if (this.player_.paused()) {
-          this.player_.play();
-        } else {
-          this.player_.pause();
-        }
-      }
-    };
+vjs.MediaTechController.prototype.removeControlsListeners = function(){
+  // We don't want to just use `this.off()` because there might be other needed
+  // listeners added by techs that extend this.
+  this.off('tap');
+  this.off('touchstart');
+  this.off('touchmove');
+  this.off('touchleave');
+  this.off('touchcancel');
+  this.off('touchend');
+  this.off('click');
+  this.off('mousedown');
+};
+
+/**
+ * Handle a click on the media element. By default will play/pause the media.
+ */
+vjs.MediaTechController.prototype.onClick = function(event){
+  // We're using mousedown to detect clicks thanks to Flash, but mousedown
+  // will also be triggered with right-clicks, so we need to prevent that
+  if (event.button !== 0) return;
+
+  // When controls are disabled a click should not toggle playback because
+  // the click is considered a control
+  if (this.player().controls()) {
+    if (this.player().paused()) {
+      this.player().play();
+    } else {
+      this.player().pause();
+    }
   }
-})();
+};
+
+/**
+ * Handle a tap on the media element. By default it will toggle the user
+ * activity state, which hides and shows the controls.
+ */
+
+vjs.MediaTechController.prototype.onTap = function(){
+  this.player().userActive(!this.player().userActive());
+};
 
 vjs.MediaTechController.prototype.features = {
   volumeControl: true,
@@ -4232,6 +4482,14 @@ vjs.Html5 = vjs.MediaTechController.extend({
       this.el_.src = source.src;
     }
 
+    // Determine if native controls should be used
+    // Our goal should be to get the custom controls on mobile solid everywhere
+    // so we can remove this all together. Right now this will block custom
+    // controls on touch enabled laptops like the Chrome Pixel
+    if (vjs.TOUCH_ENABLED && player.options()['nativeControlsForTouch'] !== false) {
+      this.useNativeControls();
+    }
+
     // Chrome and Safari both have issues with autoplay.
     // In Safari (5.1.1), when we move the video element into the container div, autoplay doesn't work.
     // In Chrome (15), if you have autoplay + a poster + no controls, the video gets hidden (but audio plays)
@@ -4243,10 +4501,7 @@ vjs.Html5 = vjs.MediaTechController.extend({
       }
     });
 
-    this.on('click', this.onClick);
-
     this.setupTriggers();
-
     this.triggerReady();
   }
 });
@@ -4313,6 +4568,37 @@ vjs.Html5.prototype.eventHandler = function(e){
   e.stopPropagation();
 };
 
+vjs.Html5.prototype.useNativeControls = function(){
+  var tech, player, controlsOn, controlsOff, cleanUp;
+
+  tech = this;
+  player = this.player();
+
+  // If the player controls are enabled turn on the native controls
+  tech.setControls(player.controls());
+
+  // Update the native controls when player controls state is updated
+  controlsOn = function(){
+    tech.setControls(true);
+  };
+  controlsOff = function(){
+    tech.setControls(false);
+  };
+  player.on('controlsenabled', controlsOn);
+  player.on('controlsdisabled', controlsOff);
+
+  // Clean up when not using native controls anymore
+  cleanUp = function(){
+    player.off('controlsenabled', controlsOn);
+    player.off('controlsdisabled', controlsOff);
+  };
+  tech.on('dispose', cleanUp);
+  player.on('usingcustomcontrols', cleanUp);
+
+  // Update the state of the player to using native controls
+  player.usingNativeControls(true);
+};
+
 
 vjs.Html5.prototype.play = function(){ this.el_.play(); };
 vjs.Html5.prototype.pause = function(){ this.el_.pause(); };
@@ -4376,29 +4662,19 @@ vjs.Html5.prototype.currentSrc = function(){ return this.el_.currentSrc; };
 
 vjs.Html5.prototype.preload = function(){ return this.el_.preload; };
 vjs.Html5.prototype.setPreload = function(val){ this.el_.preload = val; };
+
 vjs.Html5.prototype.autoplay = function(){ return this.el_.autoplay; };
 vjs.Html5.prototype.setAutoplay = function(val){ this.el_.autoplay = val; };
+
+vjs.Html5.prototype.controls = function(){ return this.el_.controls; }
+vjs.Html5.prototype.setControls = function(val){ this.el_.controls = !!val; }
+
 vjs.Html5.prototype.loop = function(){ return this.el_.loop; };
 vjs.Html5.prototype.setLoop = function(val){ this.el_.loop = val; };
 
 vjs.Html5.prototype.error = function(){ return this.el_.error; };
-  // networkState: function(){ return this.el_.networkState; },
-  // readyState: function(){ return this.el_.readyState; },
 vjs.Html5.prototype.seeking = function(){ return this.el_.seeking; };
-  // initialTime: function(){ return this.el_.initialTime; },
-  // startOffsetTime: function(){ return this.el_.startOffsetTime; },
-  // played: function(){ return this.el_.played; },
-  // seekable: function(){ return this.el_.seekable; },
 vjs.Html5.prototype.ended = function(){ return this.el_.ended; };
-  // videoTracks: function(){ return this.el_.videoTracks; },
-  // audioTracks: function(){ return this.el_.audioTracks; },
-  // videoWidth: function(){ return this.el_.videoWidth; },
-  // videoHeight: function(){ return this.el_.videoHeight; },
-  // textTracks: function(){ return this.el_.textTracks; },
-  // defaultPlaybackRate: function(){ return this.el_.defaultPlaybackRate; },
-  // playbackRate: function(){ return this.el_.playbackRate; },
-  // mediaGroup: function(){ return this.el_.mediaGroup; },
-  // controller: function(){ return this.el_.controller; },
 vjs.Html5.prototype.defaultMuted = function(){ return this.el_.defaultMuted; };
 
 /* HTML5 Support Testing ---------------------------------------------------- */
@@ -4622,9 +4898,6 @@ vjs.Flash = vjs.MediaTechController.extend({
           // Update reference to playback technology element
           tech.el_ = el;
 
-          // Now that the element is ready, make a click on the swf play the video
-          vjs.on(el, 'click', tech.bind(tech.onClick));
-
           // Make sure swf is actually ready. Sometimes the API isn't actually yet.
           vjs.Flash.checkReady(tech);
         });
@@ -4767,9 +5040,6 @@ vjs.Flash['onReady'] = function(currSwf){
 
   // Update reference to playback technology element
   tech.el_ = el;
-
-  // Now that the element is ready, make a click on the swf play the video
-  tech.on('click', tech.onClick);
 
   vjs.Flash.checkReady(tech);
 };
